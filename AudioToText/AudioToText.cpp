@@ -1,130 +1,144 @@
+// AudioToText.cpp
+#include <windows.h>
+#include <sapi.h>
+#include <sphelper.h>
 #include <iostream>
 #include <fstream>
+#include <string>
 #include <vector>
-#include <cmath>
-#include <windows.h>
-#include <mmsystem.h>
-#include <mmreg.h>
+#include <atlbase.h>      // For CComPtr
+#pragma comment(lib, "sapi.lib")
 
-#pragma comment(lib, "winmm.lib")
+// Helper: convert wide‐string to UTF8
+static std::string WideToUTF8(const std::wstring& w)
+{
+    if (w.empty()) return {};
+    int sizeNeeded = ::WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(),
+                                           NULL, 0, NULL, NULL);
+    std::string s(sizeNeeded, 0);
+    ::WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(),
+                          &s[0], sizeNeeded, NULL, NULL);
+    return s;
+}
 
-class SimpleAudioToText {
-private:
-    std::vector<short> audioData;
+bool RecognizeWavFile(const std::wstring& wavPath, std::string& outText)
+{
+    HRESULT hr = S_OK;
 
-    bool loadWavFile(const std::string& filename) {
-        HMMIO hmmio = mmioOpen((LPSTR)filename.c_str(), NULL, MMIO_READ);
-        if (!hmmio) {
-            std::cerr << "Failed to open WAV file." << std::endl;
-            return false;
-        }
-
-        MMCKINFO ckRiff;
-        ckRiff.fccType = mmioFOURCC('W', 'A', 'V', 'E');
-        if (mmioDescend(hmmio, &ckRiff, NULL, MMIO_FINDRIFF) != MMSYSERR_NOERROR) {
-            std::cerr << "File is not a valid WAV file." << std::endl;
-            mmioClose(hmmio, 0);
-            return false;
-        }
-
-        MMCKINFO ckFormat;
-        ckFormat.ckid = mmioFOURCC('f', 'm', 't', ' ');
-        if (mmioDescend(hmmio, &ckFormat, &ckRiff, MMIO_FINDCHUNK) != MMSYSERR_NOERROR) {
-            std::cerr << "Failed to find 'fmt ' chunk." << std::endl;
-            mmioClose(hmmio, 0);
-            return false;
-        }
-
-        WAVEFORMATEX wfx;
-        if (mmioRead(hmmio, (HPSTR)&wfx, sizeof(wfx)) != sizeof(wfx)) {
-            std::cerr << "Failed to read WAV format." << std::endl;
-            mmioClose(hmmio, 0);
-            return false;
-        }
-
-        mmioAscend(hmmio, &ckFormat, 0);
-
-        MMCKINFO ckData;
-        ckData.ckid = mmioFOURCC('d', 'a', 't', 'a');
-        if (mmioDescend(hmmio, &ckData, &ckRiff, MMIO_FINDCHUNK) != MMSYSERR_NOERROR) {
-            std::cerr << "Failed to find 'data' chunk." << std::endl;
-            mmioClose(hmmio, 0);
-            return false;
-        }
-
-        audioData.resize(ckData.cksize / sizeof(short));
-        if (mmioRead(hmmio, (HPSTR)audioData.data(), ckData.cksize) != ckData.cksize) {
-            std::cerr << "Failed to read audio data." << std::endl;
-            mmioClose(hmmio, 0);
-            return false;
-        }
-
-        mmioClose(hmmio, 0);
-        return true;
+    // 1) Init COM
+    hr = ::CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    if (FAILED(hr)) {
+        std::cerr << "CoInitializeEx failed: 0x" << std::hex << hr << std::endl;
+        return false;
     }
 
-    std::string simpleSpeechRecognition() {
-        // This is a very basic "recognition" that just detects silence vs. sound
-        // It's not actual speech recognition, just a placeholder for the concept
-        std::string result;
-        const int THRESHOLD = 500; // Adjust this value based on your audio
-        const int MIN_SEGMENT_LENGTH = 4000; // Minimum length of a sound segment to be considered a "word"
+    // 2) Create in-proc recognizer
+    CComPtr<ISpRecognizer> cpRecognizer;
+    hr = cpRecognizer.CoCreateInstance(CLSID_SpInprocRecognizer);
+    if (FAILED(hr)) {
+        std::cerr << "Failed to create recognizer: 0x" << std::hex << hr << std::endl;
+        ::CoUninitialize();
+        return false;
+    }
 
-        bool inWord = false;
-        int wordLength = 0;
+    // 3) Create recognition context
+    CComPtr<ISpRecoContext> cpContext;
+    hr = cpRecognizer->CreateRecoContext(&cpContext);
+    if (FAILED(hr)) {
+        std::cerr << "CreateRecoContext failed: 0x" << std::hex << hr << std::endl;
+        ::CoUninitialize();
+        return false;
+    }
 
-        for (size_t i = 0; i < audioData.size(); ++i) {
-            if (std::abs(audioData[i]) > THRESHOLD) {
-                if (!inWord) {
-                    inWord = true;
-                    wordLength = 0;
+    // 4) Set up a grammar for free‐form dictation
+    CComPtr<ISpRecoGrammar> cpGrammar;
+    hr = cpContext->CreateGrammar(1, &cpGrammar);
+    if (FAILED(hr)) {
+        std::cerr << "CreateGrammar failed: 0x" << std::hex << hr << std::endl;
+        ::CoUninitialize();
+        return false;
+    }
+
+    hr = cpGrammar->LoadDictation(NULL, SPLO_STATIC);
+    if (FAILED(hr)) {
+        std::cerr << "LoadDictation failed: 0x" << std::hex << hr << std::endl;
+        ::CoUninitialize();
+        return false;
+    }
+
+    hr = cpGrammar->SetDictationState(SPRS_ACTIVE);
+    if (FAILED(hr)) {
+        std::cerr << "SetDictationState failed: 0x" << std::hex << hr << std::endl;
+        ::CoUninitialize();
+        return false;
+    }
+
+    // 5) Open the WAV file as a SAPI audio input
+    CComPtr<ISpStream> cpFileStream;
+    hr = SPBindToFile(wavPath.c_str(), SPFM_OPEN_READONLY, &cpFileStream, &SPDFID_WaveFormatEx, NULL);
+    if (FAILED(hr)) {
+        std::cerr << "SPBindToFile failed (cannot open WAV?): 0x" << std::hex << hr << std::endl;
+        ::CoUninitialize();
+        return false;
+    }
+    hr = cpRecognizer->SetInput(cpFileStream, TRUE);
+    if (FAILED(hr)) {
+        std::cerr << "SetInput failed: 0x" << std::hex << hr << std::endl;
+        ::CoUninitialize();
+        return false;
+    }
+
+    // 6) Listen for recognition events until EOF
+    CSpEvent event;
+    while (event.GetFrom(cpContext) == S_OK) {
+        if (event.eEventId == SPEI_RECOGNITION) {
+            ISpRecoResult* pResult = event.RecoResult();
+            if (pResult) {
+                WCHAR* pwszText = nullptr;
+                hr = pResult->GetText(SP_GETWHOLEPHRASE, SP_GETWHOLEPHRASE, FALSE, &pwszText, nullptr);
+                if (SUCCEEDED(hr) && pwszText) {
+                    outText += WideToUTF8(pwszText);
+                    outText += "\n";
+                    ::CoTaskMemFree(pwszText);
                 }
-                ++wordLength;
-            }
-            else {
-                if (inWord && wordLength > MIN_SEGMENT_LENGTH) {
-                    result += "[Word] ";
-                }
-                inWord = false;
             }
         }
-
-        return result;
     }
 
-public:
-    bool convertAudioToText(const std::string& inputFile, const std::string& outputFile) {
-        if (!loadWavFile(inputFile)) {
-            return false;
-        }
+    // 7) Clean up
+    cpGrammar->SetDictationState(SPRS_INACTIVE);
+    ::CoUninitialize();
+    return !outText.empty();
+}
 
-        std::string text = simpleSpeechRecognition();
-
-        std::ofstream outFile(outputFile);
-        if (!outFile.is_open()) {
-            std::cerr << "Failed to open output file." << std::endl;
-            return false;
-        }
-
-        outFile << text;
-        outFile.close();
-
-        std::cout << "Conversion complete. Check " << outputFile << " for results." << std::endl;
-        return true;
-    }
-};
-
-int main(int argc, char* argv[]) {
+int wmain(int argc, wchar_t* argv[])
+{
     if (argc != 3) {
-        std::cerr << "Usage: " << argv[0] << " <input_wav_file> <output_txt_file>" << std::endl;
+        std::wcerr << L"Usage: " << argv[0]
+                   << L" <input_wav_file> <output_txt_file>\n";
         return 1;
     }
 
-    SimpleAudioToText converter;
-    if (!converter.convertAudioToText(argv[1], argv[2])) {
-        std::cerr << "Conversion failed." << std::endl;
+    std::wstring wavFile = argv[1];
+    std::wstring txtFile = argv[2];
+    std::string recognized;
+
+    if (!RecognizeWavFile(wavFile, recognized)) {
+        std::cerr << "Failed to recognize speech or no text found.\n";
         return 1;
     }
 
+    // Write out
+    std::ofstream ofs(txtFile, std::ios::out | std::ios::binary);
+    if (!ofs) {
+        std::cerr << "Cannot open output file: "
+                  << WideToUTF8(txtFile) << std::endl;
+        return 1;
+    }
+    ofs << recognized;
+    ofs.close();
+
+    std::cout << "Conversion complete. Output written to "
+              << WideToUTF8(txtFile) << std::endl;
     return 0;
 }
